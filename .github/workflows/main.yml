@@ -36,6 +36,19 @@ jobs:
           file /bin/bash
           echo "=== If the above shows aarch64, the binary will be ARM64-native ==="
 
+      - name: Verify compile.sh has ARM64 patch
+        run: |
+          echo "=== Checking if compile.sh has the ARM64 patch ==="
+          if grep -q 'Compiling for Linux aarch64' ./compile.sh; then
+            echo "OK: compile.sh has the ARM64 patch."
+          else
+            echo "ERROR: compile.sh does NOT have the ARM64 patch!"
+            echo "You need to update compile.sh in your repo with the patched version."
+            echo "The workflow cannot continue without it because the original compile.sh"
+            echo "forces x86_64 flags (-m64, march=x86-64) which are invalid on ARM64."
+            exit 1
+          fi
+
       - name: Prepare compile.sh download cache
         id: download-cache
         uses: actions/cache@v4
