@@ -200,17 +200,49 @@ jobs:
           mkdir -p plugins worlds
           ls -la
 
-      - name: Boot server and keep it running for 2 minutes (generates real world data)
+      - name: Boot server using start.sh and keep it running for 2 minutes
         run: |
           cd ${{ github.workspace }}/server
-          PHP_BIN="${{ github.workspace }}/bin/php7/bin/php"
-          chmod +x $PHP_BIN
 
-          echo "=== PHP binary version ==="
-          $PHP_BIN --version
+          # Make sure the PHP binary is executable (start.sh will also chmod it,
+          # but we do it here too in case the tarball lost the +x bit)
+          chmod +x ${{ github.workspace }}/bin/php7/bin/php
+          find ${{ github.workspace }}/bin -type f -name "*.so" -exec chmod +x {} \; 2>/dev/null || true
+
+          # Write start.sh exactly as in the main repo
+          cat > start.sh << 'STARTSH'
+          #!/bin/sh
+
+          chmod +x ./bin/php7/bin/php
+
+          ./bin/php7/bin/php ./PocketMine-MP.phar --no-wizard
+          STARTSH
+          chmod +x start.sh
+
+          # We need bin/ and PocketMine-MP.phar at the server/ root because start.sh
+          # references them with relative paths (./bin/php7/bin/php, ./PocketMine-MP.phar)
+          if [ ! -d ./bin ]; then
+            cp -a ${{ github.workspace }}/bin ./bin
+            chmod +x ./bin/php7/bin/php
+            find ./bin -type f -name "*.so" -exec chmod +x {} \; 2>/dev/null || true
+          fi
+          if [ ! -f ./PocketMine-MP.phar ] && [ -f ${{ github.workspace }}/server/PocketMine-MP.phar ]; then
+            : # already there
+          fi
+          ls -la
+
+          echo "=== Verifying PHP binary works ==="
+          ./bin/php7/bin/php --version
           echo "---"
 
-          nohup $PHP_BIN ${{ github.workspace }}/server/PocketMine-MP.phar --no-wizard --disable-ansi > server.log 2>&1 &
+          echo "=== Booting server with start.sh (logs to server.log) ==="
+          # --disable-ansi keeps the log clean, --no-wizard skips interactive setup
+          # We patch start.sh inline to add --disable-ansi for cleaner CI logs
+          sed -i 's|--no-wizard|--no-wizard --disable-ansi|' start.sh
+          cat start.sh
+          echo "---"
+
+          nohup ./start.sh > server.log 2>&1 &
           SERVER_PID=$!
           echo "Server PID: $SERVER_PID"
 
