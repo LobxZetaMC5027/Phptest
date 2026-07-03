@@ -380,8 +380,10 @@ jobs:
           README
 
           # Pack into tar.gz with -p to preserve permissions
+          # Use --transform to strip the leading "./" prefix so paths are clean
+          # (e.g. "bin/php7/bin/php" instead of "./bin/php7/bin/php")
           cd ${{ github.workspace }}
-          tar -czpf server-backup-PM5-PHP8.3.tar.gz -C "$STAGE" .
+          tar -czpf server-backup-PM5-PHP8.3.tar.gz -C "$STAGE" --transform 's|^\./||' .
           ls -la server-backup-PM5-PHP8.3.tar.gz
 
           echo "=== tar.gz contents (top level) ==="
