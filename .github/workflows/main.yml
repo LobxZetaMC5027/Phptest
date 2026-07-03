@@ -1,4 +1,4 @@
-name: Build and publish PHP binaries
+name: Build PHP 8.3 Linux + test + backup
 
 on:
   push:
@@ -11,64 +11,381 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  MUSL_CROSS_MAKE_VERSION: 43fcb1e63786b96add78f89d7454709ae0159fa0
+
 jobs:
-  all-builds:
-    name: PM${{ matrix.pm-version-major }} - PHP ${{ matrix.php-version-base }}
-    strategy:
-      matrix:
-        include:
-          - pm-version-major: 5
-            php-version-base: "8.1"
-          - pm-version-major: 5
-            php-version-base: "8.2"
-            special-release: default-latest #default = best for PM5, latest = display as latest on GitHub 
-          - pm-version-major: 5
-            php-version-base: "8.3"
-          - pm-version-major: 5
-            php-version-base: "8.4"
-          - pm-version-major: 5
-            php-version-base: "8.5"
-            pm-preview: true
-
-    uses: ./.github/workflows/main-pm-matrix.yml
-    with:
-      pm-version-major: ${{ matrix.pm-version-major }}
-      php-version-base: ${{ matrix.php-version-base }}
-      special-release: ${{ matrix.special-release || 'none' }}
-      pm-preview: ${{ matrix.pm-preview || false }}
-    secrets: inherit
-
-  publish-archive-release:
-    name: Publish archive release
-    needs: [all-builds]
-    runs-on: ubuntu-22.04
-    if: ${{ github.ref_name == 'stable' && github.ref_type == 'branch' && !contains(github.event.head_commit.message, '[no release]') }}
+  build-linux:
+    name: Compile PHP 8.3 Linux ARM64
+    runs-on: ubuntu-22.04-arm
+    permissions:
+      contents: write
 
     steps:
-      - name: Download artifacts
+      - uses: actions/checkout@v5
+
+      - name: Install tools and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install make autoconf automake libtool libtool-bin m4 wget libc-bin gzip bzip2 bison g++ git re2c
+
+      - name: Verify ARM64 architecture
+        run: |
+          echo "=== Architecture check ==="
+          uname -m
+          file /bin/bash
+          echo "=== If the above shows aarch64, the binary will be ARM64-native ==="
+
+      - name: Prepare compile.sh download cache
+        id: download-cache
+        uses: actions/cache@v4
+        with:
+          path: ./download_cache
+          key: compile-sh-cache-ssl-https-arm64-${{ hashFiles('./compile.sh') }}
+          restore-keys: compile-sh-cache-ssl-https-arm64-
+
+      - name: Compile PHP
+        run: |
+          chmod +x ./compile.sh
+          # Used "set -ex" instead of hashbang since script isn't executed with hashbang
+          set -ex
+          trap "exit 1" ERR
+          # On ARM64 runners, compile.sh auto-detects aarch64 and builds for ARM64 natively
+          ./compile.sh -t linux64 -j 4 -g -P 5 -c ./download_cache -D -z 8.3
+
+      - name: Verify compiled binary is ARM64
+        run: |
+          echo "=== Compiled PHP binary architecture ==="
+          file bin/php7/bin/php
+          echo "=== If it says 'ELF 64-bit LSB ... ARM aarch64', it's correct for your Cobalt 100 ARM64 ==="
+
+      - name: Create tarball
+        run: |
+          tar -czf ./PHP-8.3-Linux-ARM64-PM5.tar.gz bin
+          tar -czf ./Z-PHP-8.3-Linux-ARM64-PM5-debugging-symbols.tar.gz bin-debug
+
+      - name: Upload PHP binary artifact
+        uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: PHP-8.3-Linux-PM5
+          path: |
+            ./*PHP-8.3-Linux-ARM64-PM5*.tar.gz
+            install.log
+            compile.sh
+          if-no-files-found: error
+
+      - name: Prepare workspace for upload
+        if: failure()
+        run: tar -czf workspace.tar.gz install_data || true
+
+      - name: Upload workspace
+        uses: actions/upload-artifact@v5
+        if: failure()
+        with:
+          name: PHP-8.3-Linux-workspace-PM5
+          path: |
+            workspace.tar.gz
+          if-no-files-found: warn
+
+  test-and-backup:
+    name: Test with PocketMine-MP.phar + build backup
+    needs: build-linux
+    runs-on: ubuntu-22.04-arm
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget curl unzip tar
+
+      - name: Download Linux PHP artifact
         uses: actions/download-artifact@v6
         with:
-          path: ${{ github.workspace }}
+          name: PHP-8.3-Linux-PM5
+          path: ${{ github.workspace }}/php-bin
 
-      - name: Generate release notes
+      - name: Extract PHP binary
         run: |
-          echo "Built by: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> changelog.md
-          echo "Build number: ${{ github.run_number }}" >> changelog.md
-          echo -e "\n\n\n" >> changelog.md
-          echo ":information_source: **Linux/MacOS users**: Please see [this page](https://doc.pmmp.io/en/rtfd/faq/installation/opcache.so.html) to fix extension loading errors. Also, check out the [PocketMine-MP Linux/MacOS installer](https://doc.pmmp.io/en/rtfd/installation/get-dot-pmmp-dot-io.html)." >> changelog.md
-          echo ":warning: **Windows users**: Don't forget to install [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) or the binary will not work!" >> changelog.md
-          echo -e "\n\n\n" >> changelog.md
+          cd ${{ github.workspace }}/php-bin
+          ls -la
+          tar -xzf ./PHP-8.3-Linux-ARM64-PM5.tar.gz -C ${{ github.workspace }}
+          ls -la ${{ github.workspace }}/bin/php7/bin/
+          chmod +x ${{ github.workspace }}/bin/php7/bin/php
+          find ${{ github.workspace }}/bin -type f -name "*.so" -exec chmod +x {} \; 2>/dev/null || true
+          echo "=== Verify binary architecture ==="
+          file ${{ github.workspace }}/bin/php7/bin/php
+          ${{ github.workspace }}/bin/php7/bin/php --version
 
-      - name: Create release
-        uses: ncipollo/release-action@v1.20.0
+      - name: Download PocketMine-MP.phar from MediaFire
+        run: |
+          mkdir -p ${{ github.workspace }}/server
+          cd ${{ github.workspace }}/server
+          # MediaFire requires JS rendering to get the direct link, so we use a mediafire downloader approach
+          wget -q --tries=3 --timeout=30 "https://www.mediafire.com/file/v8he69aaxzkhpe7/PocketMine-MP.phar/file" -O mediafire_page.html || true
+          DIRECT_URL=$(grep -oP 'https://download[0-9]+\.mediafire\.com/[^"'"'"']+\.phar' mediafire_page.html | head -1 || true)
+          if [ -z "$DIRECT_URL" ]; then
+            echo "Direct URL not found in page, trying alternative methods..."
+            sudo apt-get install -y aria2 2>/dev/null || true
+            aria2c --max-tries=3 --timeout=30 -o PocketMine-MP.phar "https://www.mediafire.com/file/v8he69aaxzkhpe7/PocketMine-MP.phar/file" || true
+          else
+            echo "Found direct URL: $DIRECT_URL"
+            wget -q --tries=3 --timeout=60 "$DIRECT_URL" -O PocketMine-MP.phar
+          fi
+          ls -la PocketMine-MP.phar
+          file PocketMine-MP.phar
+
+      - name: Setup server files
+        run: |
+          cd ${{ github.workspace }}/server
+          # Create minimal server.properties
+          if [ ! -f server.properties ]; then
+            cat > server.properties << 'PROPS'
+          motd=Aquamarine Test Server
+          server-port=19132
+          whitelist=off
+          announce-player-achievements=on
+          spawn-protection=16
+          max-players=20
+          allow-flight=off
+          white-list=off
+          server-ip=
+          level-name=world
+          level-seed=
+          level-type=DEFAULT
+          force-gamemode=off
+          gamemode=0
+          difficulty=1
+          generator-settings=
+          level-settings=
+          online-mode=off
+          view-distance=8
+          allow-nether=on
+          spawn-animals=on
+          spawn-mobs=on
+          pvp=on
+          enable-query=on
+          enable-rcon=off
+          rcon.password=
+          auto-save=on
+          PROPS
+          fi
+          # Create pocketmine.yml
+          if [ ! -f pocketmine.yml ]; then
+            cat > pocketmine.yml << 'YML'
+          settings:
+            force-language: false
+            shutdown-message: "Server closed"
+            query-plugins: true
+            deprecated-verbose: true
+            async-workers: auto
+            memory-limit: 256M
+          YML
+          fi
+          mkdir -p plugins worlds
+          ls -la
+
+      - name: Boot server and keep it running for 2 minutes (generates real world data)
+        run: |
+          cd ${{ github.workspace }}/server
+          PHP_BIN="${{ github.workspace }}/bin/php7/bin/php"
+          chmod +x $PHP_BIN
+
+          echo "=== PHP binary version ==="
+          $PHP_BIN --version
+          echo "---"
+
+          nohup $PHP_BIN ${{ github.workspace }}/server/PocketMine-MP.phar --no-wizard --disable-ansi > server.log 2>&1 &
+          SERVER_PID=$!
+          echo "Server PID: $SERVER_PID"
+
+          # Phase 1: Wait until the server is fully booted (up to 180s)
+          echo "=== Phase 1: Waiting for server to finish booting (up to 180s) ==="
+          BOOT_OK=0
+          for i in $(seq 1 180); do
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+              echo "Server process died before finishing boot at second $i."
+              break
+            fi
+            if grep -qiE 'Done \(.*\)!|Done \(' server.log 2>/dev/null; then
+              echo "Server finished booting at second $i."
+              BOOT_OK=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$BOOT_OK" -ne 1 ]; then
+            echo "Server did not finish booting within 180s. Forcing stop."
+            kill -TERM $SERVER_PID 2>/dev/null || true
+            sleep 3
+            kill -KILL $SERVER_PID 2>/dev/null || true
+            echo "--- Server log ---"
+            cat server.log
+            echo "--- End of log ---"
+            exit 0
+          fi
+
+          # Phase 2: Keep it running for 2 minutes (generates real world data)
+          echo "=== Phase 2: Server is up. Letting it run for 120s to generate real data ==="
+          for i in $(seq 1 120); do
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+              echo "Server process died on its own at second $i of phase 2 (may have crashed)."
+              break
+            fi
+            sleep 1
+          done
+
+          # Phase 3: Stop the server gracefully
+          echo "=== Phase 3: Stopping server ==="
+          if kill -0 $SERVER_PID 2>/dev/null; then
+            kill -TERM $SERVER_PID || true
+            sleep 5
+            if kill -0 $SERVER_PID 2>/dev/null; then
+              echo "Server did not respond to SIGTERM, sending SIGKILL."
+              kill -KILL $SERVER_PID 2>/dev/null || true
+            fi
+          fi
+
+          echo "--- Server log (tail) ---"
+          tail -n 200 server.log
+          echo "--- End of log ---"
+
+          echo "=== Generated files ==="
+          ls -la
+          echo ""
+          echo "=== Recursive tree ==="
+          find . -maxdepth 3 -type f -printf '%y %m %p\n' | head -80
+
+      - name: Build ready-to-run server backup (binary + phar + worlds + plugins)
+        if: always()
+        run: |
+          set -x
+
+          STAGE="${{ github.workspace }}/stage"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+
+          # 1) PHP binary tree with permissions preserved
+          if [ -d ${{ github.workspace }}/bin ]; then
+            cp -a ${{ github.workspace }}/bin "$STAGE/bin"
+            chmod +x "$STAGE/bin/php7/bin/php" 2>/dev/null || true
+            find "$STAGE/bin" -type f -name "*.so" -exec chmod +x {} \; 2>/dev/null || true
+            find "$STAGE/bin" -type f -path "*/bin/*" -exec chmod +x {} \; 2>/dev/null || true
+          fi
+
+          # 2) PocketMine-MP.phar
+          if [ -f ${{ github.workspace }}/server/PocketMine-MP.phar ]; then
+            cp -a ${{ github.workspace }}/server/PocketMine-MP.phar "$STAGE/PocketMine-MP.phar"
+          fi
+
+          # 3) Server configs
+          for f in server.properties pocketmine.yml ops.txt whitelist.txt banned-players.txt banned-ips.txt; do
+            if [ -f ${{ github.workspace }}/server/$f ]; then
+              cp -a ${{ github.workspace }}/server/$f "$STAGE/$f"
+            fi
+          done
+
+          # 4) Worlds
+          if [ -d ${{ github.workspace }}/server/worlds ]; then
+            cp -a ${{ github.workspace }}/server/worlds "$STAGE/worlds"
+          fi
+          for w in world nether ender; do
+            if [ -d ${{ github.workspace }}/server/$w ]; then
+              cp -a ${{ github.workspace }}/server/$w "$STAGE/$w"
+            fi
+          done
+
+          # 5) Plugins + plugin_data
+          if [ -d ${{ github.workspace }}/server/plugins ]; then
+            cp -a ${{ github.workspace }}/server/plugins "$STAGE/plugins"
+          fi
+          if [ -d ${{ github.workspace }}/server/plugin_data ]; then
+            cp -a ${{ github.workspace }}/server/plugin_data "$STAGE/plugin_data"
+          fi
+
+          # 6) Crashdumps
+          if [ -d ${{ github.workspace }}/server/crashdumps ]; then
+            cp -a ${{ github.workspace }}/server/crashdumps "$STAGE/crashdumps"
+          fi
+
+          # 7) Server log
+          if [ -f ${{ github.workspace }}/server/server.log ]; then
+            cp -a ${{ github.workspace }}/server/server.log "$STAGE/server.log"
+          fi
+
+          # 8) Trazability: install.log + compile.sh
+          if [ -f ${{ github.workspace }}/php-bin/install.log ]; then
+            cp -a ${{ github.workspace }}/php-bin/install.log "$STAGE/install.log"
+          fi
+          if [ -f ${{ github.workspace }}/php-bin/compile.sh ]; then
+            cp -a ${{ github.workspace }}/php-bin/compile.sh "$STAGE/compile.sh"
+          fi
+
+          echo "=== Backup top-level layout ==="
+          ls -la "$STAGE"
+          echo ""
+          echo "=== Tree (depth 2) ==="
+          find "$STAGE" -maxdepth 2 -printf '%y %m %p\n' | head -60
+          echo ""
+          echo "=== Total size ==="
+          du -sh "$STAGE"
+
+          cat > "$STAGE/README.txt" << 'README'
+          Aquamarine - Server backup
+          =========================================
+
+          This tar.gz contains EVERYTHING you need to run the server on a fresh Linux box:
+
+            bin/                  PHP 8.3 binary tree (with pmmpthread, yaml, etc.)
+            PocketMine-MP.phar    Aquamarine phar
+            server.properties     server config
+            pocketmine.yml        pocketmine config
+            worlds/               generated worlds
+            plugins/              plugins folder
+            plugin_data/          plugin data folder (if any)
+            server.log            log captured during the 2-minute test boot
+            crashdumps/           crashdumps (if the server crashed)
+            install.log           PHP compile log (for reference)
+            compile.sh            compile script used (for reference)
+
+          HOW TO RUN ON A FRESH SERVER:
+          ------------------------------
+            1. Create an empty folder on the destination server, e.g.:
+                 mkdir -p /opt/aquamarine && cd /opt/aquamarine
+
+            2. Extract this tar.gz INSIDE that folder (no extra parent folder,
+               all files extract directly into the current dir):
+                 tar -xzf server-backup-*.tar.gz
+
+            3. Boot the server:
+                 ./bin/php7/bin/php PocketMine-MP.phar
+
+          The PHP binary keeps its +x permission (tar -p preserves it).
+          README
+
+          # Pack into tar.gz with -p to preserve permissions
+          cd ${{ github.workspace }}
+          tar -czpf server-backup-PM5-PHP8.3.tar.gz -C "$STAGE" .
+          ls -la server-backup-PM5-PHP8.3.tar.gz
+
+          echo "=== tar.gz contents (top level) ==="
+          tar -tzf server-backup-PM5-PHP8.3.tar.gz | head -20
+
+      - name: Upload server backup (tar.gz, flat layout, permissions preserved)
+        if: always()
+        uses: actions/upload-artifact@v5
         with:
-          artifacts: |
-            ${{ github.workspace }}/*PHP-*-PM*/*.tar.gz
-            ${{ github.workspace }}/*PHP-*-Windows-PM*/*.zip
-            ${{ github.workspace }}/*PHP-*.gdbinit/*.gdbinit
+          name: ServerBackup-PM5-PHP8.3
+          path: ${{ github.workspace }}/server-backup-PM5-PHP8.3.tar.gz
+          if-no-files-found: warn
 
-          name: PHP (Build ${{ github.run_number }}) - Archive
-          tag: php-build-${{ github.run_number }}
-          commit: ${{ github.sha }}
-          allowUpdates: false
-          bodyFile: ${{ github.workspace }}/changelog.md
+      - name: Upload server log
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: ServerLog-PM5-PHP8.3
+          path: ${{ github.workspace }}/server/server.log
+          if-no-files-found: warn
