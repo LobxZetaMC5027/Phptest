@@ -319,6 +319,27 @@ jobs:
             chmod +x "$STAGE/bin/php7/bin/php" 2>/dev/null || true
             find "$STAGE/bin" -type f -name "*.so" -exec chmod +x {} \; 2>/dev/null || true
             find "$STAGE/bin" -type f -path "*/bin/*" -exec chmod +x {} \; 2>/dev/null || true
+
+            # CRITICAL FIX: resolve all symlinks in bin/ to regular files.
+            # GitHub Actions upload-artifact re-zips the tar.gz internally with zip,
+            # and zip does NOT preserve symlinks reliably (especially relative ones
+            # like libyaml-0.so.2 -> libyaml-0.so.2.0.5). When the artifact is
+            # extracted on the destination server (e.g. Pterodactyl), the symlink
+            # becomes a 0-byte file and PHP fails with:
+            #   "error while loading shared libraries: libyaml-0.so.2: file too short"
+            # We replace every symlink with a real copy of its target so the
+            # artifact survives the zip roundtrip unscathed.
+            echo "=== Resolving symlinks in bin/ to regular files ==="
+            find "$STAGE/bin" -type l | while read -r LINK; do
+              TARGET=$(readlink -f "$LINK")
+              if [ -n "$TARGET" ] && [ -f "$TARGET" ]; then
+                rm -f "$LINK"
+                cp -a "$TARGET" "$LINK"
+                chmod +x "$LINK" 2>/dev/null || true
+              fi
+            done
+            # Also make sure all the .so files are real (not symlinks)
+            find "$STAGE/bin" -type f -name "*.so*" -exec chmod +x {} \; 2>/dev/null || true
           fi
 
           # 2) PocketMine-MP.phar
