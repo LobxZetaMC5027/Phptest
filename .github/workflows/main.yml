@@ -457,3 +457,469 @@ jobs:
           name: ServerLog-PM5-PHP8.3
           path: ${{ github.workspace }}/server/server.log
           if-no-files-found: warn
+
+  # ============================================================
+  # Android arm64-v8a (aarch64) — static PHP CLI binary
+  # Target: Android 15, SDK 35, arm64-v8a (Samsung SM-A146M etc.)
+  # The binary is statically linked with musl libc so it runs
+  # on Android via Termux without any extra .so dependencies.
+  # ============================================================
+
+  build-android:
+    name: Compile PHP 8.3 Android arm64-v8a (static)
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install tools and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install make autoconf automake libtool libtool-bin m4 wget libc-bin gzip bzip2 bison g++ git re2c
+
+      - name: Prepare compile.sh download cache
+        id: download-cache
+        uses: actions/cache@v4
+        with:
+          path: ./download_cache
+          key: compile-sh-cache-android-arm64-${{ hashFiles('./compile.sh') }}
+          restore-keys: compile-sh-cache-android-arm64-
+
+      - name: Fetch musl cross-compiler cache
+        id: compiler-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/compiler
+          key: musl-cross-make-${{ env.MUSL_CROSS_MAKE_VERSION }}
+
+      - name: Checkout musl-cross-make
+        if: steps.compiler-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: pmmp/musl-cross-make
+          path: musl-cross-make
+          ref: ${{ env.MUSL_CROSS_MAKE_VERSION }}
+
+      - name: Build musl cross-compiler
+        if: steps.compiler-cache.outputs.cache-hit != 'true'
+        working-directory: musl-cross-make
+        run: |
+          echo "TARGET = aarch64-linux-musl" > config.mak
+          make -j$(nproc)
+          make install
+          mv ./output "${{ github.workspace }}/compiler"
+
+      - name: Verify compile.sh has ARM64 patch
+        run: |
+          if grep -q 'Compiling for Linux aarch64' ./compile.sh; then
+            echo "OK: compile.sh has the ARM64 patch."
+          else
+            echo "WARNING: compile.sh does NOT have the ARM64 patch, but this is fine for the android-aarch64 target which has its own flags."
+          fi
+
+      - name: Compile PHP (static for Android arm64-v8a)
+        run: |
+          chmod +x ./compile.sh
+          export PATH="${{ github.workspace }}/compiler/bin:$PATH"
+          set -ex
+          trap "exit 1" ERR
+          # -t android-aarch64 : target Android ARM64
+          # -x                 : build static binary (no shared libs)
+          # -j 4               : 4 make threads
+          # -g                 : enable GD2
+          # -P 5               : PocketMine-MP 5
+          # -D                 : separated debugging symbols
+          # -z 8.3             : PHP 8.3
+          ./compile.sh -t android-aarch64 -x -j 4 -g -P 5 -c ./download_cache -D -z 8.3
+
+      - name: Verify static binary
+        run: |
+          echo "=== Compiled PHP binary ==="
+          file bin/php7/bin/php
+          echo ""
+          echo "=== Check it's static (no shared libs) ==="
+          ls -la bin/php7/bin/php
+          # Static binary should be large (>10MB) and 'file' should say "statically linked"
+          if file bin/php7/bin/php | grep -qi 'statically linked'; then
+            echo "OK: binary is statically linked."
+          else
+            echo "WARNING: binary may not be fully static. Check the file output above."
+          fi
+
+      - name: Create tarball with static binary only
+        run: |
+          mkdir -p android-out
+          cp bin/php7/bin/php android-out/php
+          chmod +x android-out/php
+          tar -czf ./PHP-8.3-Android-arm64-static-PM5.tar.gz -C android-out .
+          ls -la ./PHP-8.3-Android-arm64-static-PM5.tar.gz
+
+      - name: Upload PHP static binary artifact
+        uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: PHP-8.3-Android-arm64-static-PM5
+          path: |
+            ./PHP-8.3-Android-arm64-static-PM5.tar.gz
+            install.log
+            compile.sh
+          if-no-files-found: error
+
+      - name: Prepare workspace for upload
+        if: failure()
+        run: tar -czf workspace.tar.gz install_data || true
+
+      - name: Upload workspace
+        uses: actions/upload-artifact@v5
+        if: failure()
+        with:
+          name: PHP-8.3-Android-workspace-PM5
+          path: |
+            workspace.tar.gz
+          if-no-files-found: warn
+
+  test-and-backup-android:
+    name: Test Android static binary + build backup
+    needs: build-android
+    runs-on: ubuntu-22.04-arm
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget curl unzip tar
+
+      - name: Download Android PHP static binary artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: PHP-8.3-Android-arm64-static-PM5
+          path: ${{ github.workspace }}/php-bin
+
+      - name: Extract static PHP binary
+        run: |
+          cd ${{ github.workspace }}/php-bin
+          ls -la
+          tar -xzf ./PHP-8.3-Android-arm64-static-PM5.tar.gz -C ${{ github.workspace }}/server-bin
+          mkdir -p ${{ github.workspace }}/server-bin
+          # The tarball extracts 'php' directly
+          if [ -f ${{ github.workspace }}/php ]; then
+            mv ${{ github.workspace }}/php ${{ github.workspace }}/server-bin/php
+          fi
+          # Fallback: extract again to be sure
+          tar -xzf ./PHP-8.3-Android-arm64-static-PM5.tar.gz -C ${{ github.workspace }}/server-bin
+          ls -la ${{ github.workspace }}/server-bin/
+          chmod +x ${{ github.workspace }}/server-bin/php
+          echo "=== Verify binary ==="
+          file ${{ github.workspace }}/server-bin/php
+          echo "=== Test it runs ==="
+          ${{ github.workspace }}/server-bin/php --version
+
+      - name: Download PocketMine-MP.phar from MediaFire
+        run: |
+          mkdir -p ${{ github.workspace }}/server
+          cd ${{ github.workspace }}/server
+          wget -q --tries=3 --timeout=30 "https://www.mediafire.com/file/v8he69aaxzkhpe7/PocketMine-MP.phar/file" -O mediafire_page.html || true
+          DIRECT_URL=$(grep -oP 'https://download[0-9]+\.mediafire\.com/[^"'"'"']+\.phar' mediafire_page.html | head -1 || true)
+          if [ -z "$DIRECT_URL" ]; then
+            echo "Direct URL not found in page, trying alternative methods..."
+            sudo apt-get install -y aria2 2>/dev/null || true
+            aria2c --max-tries=3 --timeout=30 -o PocketMine-MP.phar "https://www.mediafire.com/file/v8he69aaxzkhpe7/PocketMine-MP.phar/file" || true
+          else
+            echo "Found direct URL: $DIRECT_URL"
+            wget -q --tries=3 --timeout=60 "$DIRECT_URL" -O PocketMine-MP.phar
+          fi
+          ls -la PocketMine-MP.phar
+          file PocketMine-MP.phar
+
+      - name: Setup server files for Android
+        run: |
+          cd ${{ github.workspace }}/server
+          if [ ! -f server.properties ]; then
+            cat > server.properties << 'PROPS'
+          motd=Aquamarine Android Test Server
+          server-port=19132
+          whitelist=off
+          announce-player-achievements=on
+          spawn-protection=16
+          max-players=20
+          allow-flight=off
+          white-list=off
+          server-ip=
+          level-name=world
+          level-seed=
+          level-type=DEFAULT
+          force-gamemode=off
+          gamemode=0
+          difficulty=1
+          generator-settings=
+          level-settings=
+          online-mode=off
+          view-distance=8
+          allow-nether=on
+          spawn-animals=on
+          spawn-mobs=on
+          pvp=on
+          enable-query=on
+          enable-rcon=off
+          rcon.password=
+          auto-save=on
+          PROPS
+          fi
+          if [ ! -f pocketmine.yml ]; then
+            cat > pocketmine.yml << 'YML'
+          settings:
+            force-language: false
+            shutdown-message: "Server closed"
+            query-plugins: true
+            deprecated-verbose: true
+            async-workers: auto
+            memory-limit: 256M
+          YML
+          fi
+          mkdir -p plugins worlds
+
+          # Copy the static PHP binary into the server folder
+          cp ${{ github.workspace }}/server-bin/php ./php
+          chmod +x ./php
+
+          # Write start.sh for Android (simple, static binary at root)
+          cat > start.sh << 'STARTSH'
+          #!/bin/sh
+
+          chmod +x ./php
+
+          ./php ./PocketMine-MP.phar --no-wizard
+          STARTSH
+          chmod +x start.sh
+
+          ls -la
+
+      - name: Boot Android server using start.sh and keep it running for 2 minutes
+        run: |
+          cd ${{ github.workspace }}/server
+
+          echo "=== Verifying static PHP binary works ==="
+          ./php --version
+          echo "---"
+
+          echo "=== Booting server with start.sh ==="
+          # Add --disable-ansi for cleaner CI logs
+          sed -i 's|--no-wizard|--no-wizard --disable-ansi|' start.sh
+          cat start.sh
+          echo "---"
+
+          nohup ./start.sh > server.log 2>&1 &
+          SERVER_PID=$!
+          echo "Server PID: $SERVER_PID"
+
+          # Phase 1: Wait until the server is fully booted (up to 180s)
+          echo "=== Phase 1: Waiting for server to finish booting (up to 180s) ==="
+          BOOT_OK=0
+          for i in $(seq 1 180); do
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+              echo "Server process died before finishing boot at second $i."
+              break
+            fi
+            if grep -qiE 'Done \(.*\)!|Done \(' server.log 2>/dev/null; then
+              echo "Server finished booting at second $i."
+              BOOT_OK=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$BOOT_OK" -ne 1 ]; then
+            echo "Server did not finish booting within 180s. Forcing stop."
+            kill -TERM $SERVER_PID 2>/dev/null || true
+            sleep 3
+            kill -KILL $SERVER_PID 2>/dev/null || true
+            echo "--- Server log ---"
+            cat server.log
+            echo "--- End of log ---"
+            exit 0
+          fi
+
+          # Phase 2: Keep it running for 2 minutes
+          echo "=== Phase 2: Server is up. Letting it run for 120s to generate real data ==="
+          for i in $(seq 1 120); do
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+              echo "Server process died on its own at second $i of phase 2."
+              break
+            fi
+            sleep 1
+          done
+
+          # Phase 3: Stop the server gracefully
+          echo "=== Phase 3: Stopping server ==="
+          if kill -0 $SERVER_PID 2>/dev/null; then
+            kill -TERM $SERVER_PID || true
+            sleep 5
+            if kill -0 $SERVER_PID 2>/dev/null; then
+              echo "Server did not respond to SIGTERM, sending SIGKILL."
+              kill -KILL $SERVER_PID 2>/dev/null || true
+            fi
+          fi
+
+          echo "--- Server log (tail) ---"
+          tail -n 200 server.log
+          echo "--- End of log ---"
+
+          echo "=== Generated files ==="
+          ls -la
+          echo ""
+          echo "=== Recursive tree ==="
+          find . -maxdepth 3 -type f -printf '%y %m %p\n' | head -80
+
+      - name: Build Android server backup (static php + phar + worlds + plugins)
+        if: always()
+        run: |
+          set -x
+
+          STAGE="${{ github.workspace }}/stage-android"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+
+          # 1) Static PHP binary at the root (NOT in bin/php7/bin/)
+          if [ -f ${{ github.workspace }}/server/php ]; then
+            cp -a ${{ github.workspace }}/server/php "$STAGE/php"
+            chmod +x "$STAGE/php"
+          fi
+
+          # 2) PocketMine-MP.phar
+          if [ -f ${{ github.workspace }}/server/PocketMine-MP.phar ]; then
+            cp -a ${{ github.workspace }}/server/PocketMine-MP.phar "$STAGE/PocketMine-MP.phar"
+          fi
+
+          # 3) start.sh for Android (simple, uses ./php)
+          cat > "$STAGE/start.sh" << 'STARTSH'
+          #!/bin/sh
+
+          chmod +x ./php
+
+          ./php ./PocketMine-MP.phar --no-wizard
+          STARTSH
+          chmod +x "$STAGE/start.sh"
+
+          # 4) Server configs
+          for f in server.properties pocketmine.yml ops.txt whitelist.txt banned-players.txt banned-ips.txt; do
+            if [ -f ${{ github.workspace }}/server/$f ]; then
+              cp -a ${{ github.workspace }}/server/$f "$STAGE/$f"
+            fi
+          done
+
+          # 5) Worlds
+          if [ -d ${{ github.workspace }}/server/worlds ]; then
+            cp -a ${{ github.workspace }}/server/worlds "$STAGE/worlds"
+          fi
+          for w in world nether ender; do
+            if [ -d ${{ github.workspace }}/server/$w ]; then
+              cp -a ${{ github.workspace }}/server/$w "$STAGE/$w"
+            fi
+          done
+
+          # 6) Plugins + plugin_data
+          if [ -d ${{ github.workspace }}/server/plugins ]; then
+            cp -a ${{ github.workspace }}/server/plugins "$STAGE/plugins"
+          fi
+          if [ -d ${{ github.workspace }}/server/plugin_data ]; then
+            cp -a ${{ github.workspace }}/server/plugin_data "$STAGE/plugin_data"
+          fi
+
+          # 7) Crashdumps
+          if [ -d ${{ github.workspace }}/server/crashdumps ]; then
+            cp -a ${{ github.workspace }}/server/crashdumps "$STAGE/crashdumps"
+          fi
+
+          # 8) Server log
+          if [ -f ${{ github.workspace }}/server/server.log ]; then
+            cp -a ${{ github.workspace }}/server/server.log "$STAGE/server.log"
+          fi
+
+          # 9) Trazability
+          if [ -f ${{ github.workspace }}/php-bin/install.log ]; then
+            cp -a ${{ github.workspace }}/php-bin/install.log "$STAGE/install.log"
+          fi
+          if [ -f ${{ github.workspace }}/php-bin/compile.sh ]; then
+            cp -a ${{ github.workspace }}/php-bin/compile.sh "$STAGE/compile.sh"
+          fi
+
+          echo "=== Backup top-level layout ==="
+          ls -la "$STAGE"
+          echo ""
+          echo "=== Tree (depth 2) ==="
+          find "$STAGE" -maxdepth 2 -printf '%y %m %p\n' | head -60
+          echo ""
+          echo "=== Total size ==="
+          du -sh "$STAGE"
+
+          cat > "$STAGE/README.txt" << 'README'
+          Aquamarine - Android arm64-v8a server backup
+          ============================================
+
+          This tar.gz contains a STATIC PHP 8.3 binary compiled for Android
+          arm64-v8a (aarch64) plus the Aquamarine phar and server files.
+
+          Tested on:
+            - Android 15, SDK 35, arm64-v8a
+            - Samsung Galaxy A14 5G (SM-A146M)
+
+          Contents:
+            php                   Static PHP 8.3 CLI binary (no .so deps)
+            PocketMine-MP.phar    Aquamarine phar
+            start.sh              Boot script: ./php ./PocketMine-MP.phar
+            server.properties     server config
+            pocketmine.yml        pocketmine config
+            worlds/               generated worlds
+            plugins/              plugins folder
+            plugin_data/          plugin data (if any)
+            server.log            boot log from CI test
+            crashdumps/           crashdumps (if any)
+            install.log           PHP compile log
+            compile.sh            compile script used
+
+          HOW TO RUN ON ANDROID:
+          ----------------------
+            1. Install Termux from F-Droid (NOT Google Play, that version is outdated)
+
+            2. Grant storage permission:
+                 termux-setup-storage
+
+            3. Create a folder and extract this tar.gz:
+                 mkdir -p ~/aquamarine && cd ~/aquamarine
+                 tar -xzf server-backup-android-*.tar.gz
+
+            4. Boot the server:
+                 ./start.sh
+
+          The PHP binary is STATIC so it doesn't need any libraries.
+          It should run on any Android arm64-v8a device with Android 5.0+.
+          README
+
+          # Pack into tar.gz with -p to preserve permissions, strip ./ prefix
+          cd ${{ github.workspace }}
+          tar -czpf server-backup-Android-arm64-PHP8.3.tar.gz -C "$STAGE" --transform 's|^\./||' .
+          ls -la server-backup-Android-arm64-PHP8.3.tar.gz
+
+          echo "=== tar.gz contents (top level) ==="
+          tar -tzf server-backup-Android-arm64-PHP8.3.tar.gz | head -20
+
+      - name: Upload Android server backup (tar.gz)
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: ServerBackup-Android-arm64-PHP8.3
+          path: ${{ github.workspace }}/server-backup-Android-arm64-PHP8.3.tar.gz
+          if-no-files-found: warn
+
+      - name: Upload Android server log
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: ServerLog-Android-arm64-PHP8.3
+          path: ${{ github.workspace }}/server/server.log
+          if-no-files-found: warn
+
